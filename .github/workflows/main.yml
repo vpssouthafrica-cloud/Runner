@@ -1,0 +1,786 @@
+# ============================================================================
+#  Windows RDP (guided, zero-setup, auto-looping)
+# ============================================================================
+#  WHAT IT DOES
+#    Starts a fresh Windows Server on GitHub Actions, joins it to Tailscale,
+#    turns on RDP, and keeps it alive for a set number of minutes. On the first
+#    run it SHOWS A TAILSCALE LINK and PAUSES until the machine is linked, then
+#    continues automatically. When time is up it saves your files + the
+#    Tailscale login and starts the next machine.
+#
+#  NO SECRETS REQUIRED
+#    - Files and the Tailscale login are kept with the Actions cache, not a
+#      separate repo, so there is no GH_PAT and no "state" repo to create.
+#    - The auto-loop uses the built-in GITHUB_TOKEN.
+#    - The RDP password is generated once, saved with the state, and printed
+#      in the run so you can connect.
+#    - Optional Telegram: paste a bot token into the "telegram_token" field
+#      ONCE. The workflow prints a t.me link, you tap Start, and it finds your
+#      chat automatically. The token and chat id are saved with the state, so
+#      later runs (even manual ones) reuse them with no typing.
+#
+#  QUICK SETUP
+#    1. Put this file at .github/workflows/rdp.yml in a PRIVATE repo.
+#    2. (Optional) Create a Telegram bot once: open https://t.me/BotFather,
+#       send /newbot, pick a name, copy the token. You will paste it when
+#       starting the workflow. No GitHub settings needed.
+#    3. Actions > Windows RDP > Run workflow. Paste the bot token if you have
+#       one. Leave everything else as is.
+#    4. Open the Tailscale link that appears in the log/summary/Telegram.
+#    5. When the banner "RDP CONNECTION DETAILS" appears, use Host/IP +
+#       Username + Password with any RDP client.
+#
+#  HOW USERS CONNECT
+#    - Install Tailscale on the device and sign in with the same account.
+#    - Open an RDP app (Windows Remote Desktop, Microsoft Remote Desktop,
+#      Remmina, ...) and enter the Host/IP, Username and Password.
+#
+#  NOTES
+#    - One machine runs at most ~5h30m (GitHub limit); the loop restarts it.
+#    - Files in D:\Migration always persist across machines (via the cache).
+#    - The RDP username/password are printed in the run. Keep the repo PRIVATE.
+#    - Optional settings (TS_HOSTNAME, RDP_USER) may be repo Variables or
+#      Secrets. TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID also work as secrets.
+# ============================================================================
+
+name: Windows RDP (auto-loop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "How long to keep the machine up (minutes, max 340)"
+        required: false
+        default: "330"
+      test_mode:
+        description: "Test run (5 minutes, does not auto-loop)"
+        type: boolean
+        default: false
+      telegram_token:
+        description: "Paste your @BotFather token here (optional; saved automatically for next runs)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: rdp-singleton
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      RDP_USER: ${{ vars.RDP_USER || secrets.RDP_USER || 'rdpuser' }}
+      TS_HOSTNAME: ${{ vars.TS_HOSTNAME || secrets.TS_HOSTNAME || 'myrdp' }}
+      MIGRATION: D:\Migration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      # 0. Explain the flow. Never fails.
+      # ----------------------------------------------------------------------
+      - name: Setup check and connection guide
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_INPUT: ${{ inputs.telegram_token }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sum = $env:GITHUB_STEP_SUMMARY
+          function W($t) { if ($sum) { $t | Out-File -FilePath $sum -Append -Encoding utf8 } }
+
+          $tgReady = [bool]($env:TG_TOKEN -or $env:TG_INPUT)
+          $runUrl = "https://github.com/${{ github.repository }}/actions/workflows/rdp.yml"
+          W "# Windows RDP - setup"
+          W ""
+          W "**This page is the control panel:** $runUrl"
+          W ""
+          W "Click **Run workflow** there. The **telegram_token** box is where you paste the token - that is the input UI."
+          W ""
+          W "## What will happen"
+          if ($env:TS_AUTHKEY) {
+            W "1. This machine joins Tailscale with your auth key."
+          } else {
+            W "1. A **Tailscale login link** appears below and the workflow **pauses** until you link the machine."
+          }
+          W "2. RDP is enabled. A password is generated once, saved with the state, and printed."
+          W "3. You get the Host/IP, Username and Password (in the log, summary and Telegram)."
+          W "4. Files in ``D:\Migration`` and the Tailscale login are saved for the next machine."
+          W ""
+          W "## Configuration"
+          W "| Setting | Status |"
+          W "| --- | --- |"
+          W "| State + auto-loop | built in (no secrets, no extra repo) |"
+          W "| Telegram | $(if ($tgReady) { 'enabled' } else { 'not set (optional) - paste a bot token in the Run workflow field' }) |"
+          W "| Tailscale | $(if ($env:TS_AUTHKEY) { 'auth key' } else { 'interactive link' }) |"
+          W "| RDP password | $(if ($env:RDP_PASSWORD) { 'from secret' } else { 'will be generated + saved' }) |"
+          W ""
+          W "## How users connect"
+          W "1. Install Tailscale on the phone/PC and sign in to the same Tailscale account."
+          W "2. Open an RDP client (Windows Remote Desktop, Microsoft Remote Desktop, Remmina, ...)."
+          W "3. Use the **Host/IP**, **Username** and **Password** from the end of this run."
+          W ""
+          W "## Telegram (optional, one paste)"
+          if ($tgReady) {
+            W "A t.me link will appear in a moment. Tap it, press **Start**, and this run sends the details to that chat."
+            W "The token and chat are then saved with the state, so future runs need no input."
+          } else {
+            W "1. Open https://t.me/BotFather and send ``/newbot``. Pick a name."
+            W "2. Copy the token it gives you (looks like ``123456:ABC-DEF...``)."
+            W "3. On this repo page: **Actions > Windows RDP > Run workflow**, and paste it into the **telegram_token** box. That box is the input UI - no Settings screen and no secret."
+            W "4. Open the t.me link printed below, press **Start**, and setup is complete. The token + chat are saved automatically, so next time you just click Run workflow."
+          }
+          W ""
+          Write-Host "Setup check complete."
+
+      # ----------------------------------------------------------------------
+      # 1. Install Tailscale, then stop it so its login can be restored.
+      # ----------------------------------------------------------------------
+      - name: Install Tailscale
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "Installing Tailscale..."
+            $dst = Join-Path $env:TEMP "tailscale-setup.exe"
+            Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $dst -UseBasicParsing
+            Start-Process $dst -ArgumentList "/quiet" -Wait
+          } else {
+            Write-Host "Tailscale already installed."
+          }
+
+      - name: Stop Tailscale (ready for state restore)
+        run: |
+          $ErrorActionPreference = "Continue"
+          Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          New-Item -ItemType Directory -Force -Path $env:MIGRATION | Out-Null
+          Write-Host "Tailscale stopped."
+
+      # ----------------------------------------------------------------------
+      # 2. Restore files + Tailscale login from the last machine (Actions
+      #    cache - no repo, no token, no secrets).
+      # ----------------------------------------------------------------------
+      - name: Restore state (files + Tailscale login)
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\Migration
+          key: rdp-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            rdp-state-
+
+      - name: Prepare migration folder and Tailscale login
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path $env:MIGRATION | Out-Null
+          $src = Join-Path $env:MIGRATION "tailscale"
+          $loc = @(
+            @{ Name = "programdata"; Path = "C:\ProgramData\Tailscale" },
+            @{ Name = "user";        Path = (Join-Path $env:LOCALAPPDATA "Tailscale") },
+            @{ Name = "system";      Path = "C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale" }
+          )
+          $restored = 0
+          foreach ($l in $loc) {
+            $from = Join-Path $src $l.Name
+            if (-not (Test-Path $from)) { continue }
+            New-Item -ItemType Directory -Force -Path $l.Path | Out-Null
+            Get-ChildItem -Path $from -File -ErrorAction SilentlyContinue | ForEach-Object {
+              $to = Join-Path $l.Path $_.Name
+              Copy-Item $_.FullName $to -Force -ErrorAction SilentlyContinue
+              if (Test-Path $to) {
+                Write-Host ("Restored Tailscale state: " + $to)
+                $restored++
+              }
+            }
+          }
+          if ($restored -gt 0) {
+            Write-Host "Tailscale login restored from cache ($restored file(s))."
+          } else {
+            Write-Host "No saved Tailscale login found - a fresh link may be needed."
+          }
+          if (Test-Path (Join-Path $env:MIGRATION "rdp_password.txt")) {
+            Write-Host "Previous files restored from cache."
+          } else {
+            Write-Host "No previous files - starting fresh."
+          }
+
+      # ----------------------------------------------------------------------
+      # 3. Telegram: print a t.me link the user can tap, then capture the chat
+      #    id automatically. Totally optional and never blocks the RDP setup.
+      # ----------------------------------------------------------------------
+      - name: Connect Telegram (optional, no secrets needed)
+        env:
+          TG_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_TOKEN_VAR: ${{ vars.TELEGRAM_BOT_TOKEN }}
+          TG_TOKEN_INPUT: ${{ inputs.telegram_token }}
+          TG_CHAT_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_CHAT_VAR: ${{ vars.TELEGRAM_CHAT_ID }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sum = $env:GITHUB_STEP_SUMMARY
+          function W($t) { if ($sum) { $t | Out-File -FilePath $sum -Append -Encoding utf8 } }
+
+          $fromInput = $false
+          $tg = $env:TG_TOKEN_INPUT
+          if ($tg) { $fromInput = $true } else { $tg = $env:TG_TOKEN_SECRET }
+          if (-not $tg) { $tg = $env:TG_TOKEN_VAR }
+          $tokFile = Join-Path $env:MIGRATION "telegram_token.txt"
+          if (-not $tg -and (Test-Path $tokFile)) {
+            $tg = (Get-Content $tokFile -Raw).Trim()
+          }
+          $chat = $env:TG_CHAT_SECRET
+          if (-not $chat) { $chat = $env:TG_CHAT_VAR }
+          $chatFile = Join-Path $env:MIGRATION "telegram_chat_id.txt"
+          if (-not $chat -and (Test-Path $chatFile)) { $chat = (Get-Content $chatFile -Raw).Trim() }
+          if ($tg -and $fromInput) {
+            try {
+              Set-Content -Path $tokFile -Value $tg -NoNewline -Encoding utf8
+              Write-Host "Telegram token saved for future runs."
+            } catch {}
+          } elseif ($tg) {
+            Write-Host "Using the saved Telegram token."
+          }
+
+          if (-not $tg) {
+            W ""
+            W "## Telegram: not set up (optional)"
+            Write-Host "No Telegram token - skipping Telegram (optional)."
+            "TG_TOKEN_RESOLVED=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TG_CHAT_RESOLVED=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TG_OFFSET=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "TG_FROM_INPUT=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
+
+          Write-Output "::add-mask::$tg"
+          $botUser = $null
+          try { $me = Invoke-RestMethod "https://api.telegram.org/bot$tg/getMe"; $botUser = $me.result.username } catch { Write-Host "Telegram getMe failed (bad token?): $_" }
+
+          $code = "r${{ github.run_id }}"
+          if ($botUser) {
+            $link = "https://t.me/${botUser}?start=$code"
+            Write-Host "=========================================================="
+            Write-Host " TELEGRAM: open this link to connect your chat"
+            Write-Host " $link"
+            Write-Host "=========================================================="
+            W ""
+            W "## Telegram: open this link"
+            W ""
+            W "**$link**"
+            W ""
+            W "Tap it, press **Start**, and this run sends the RDP details and buttons to that chat."
+            Write-Host "::notice title=Telegram link::Open $link and press Start to receive RDP details."
+          } else {
+            W ""
+            W "## Telegram: the bot could not be reached. Check that the token is correct."
+          }
+
+          # Drop stale updates so old /start or button presses do not replay.
+          $offset = 0
+          try {
+            $last = Invoke-RestMethod "https://api.telegram.org/bot$tg/getUpdates?offset=-1&limit=1&timeout=0"
+            $u = @($last.result) | Select-Object -Last 1
+            if ($u) { $offset = [long]$u.update_id + 1 }
+          } catch {}
+
+          $deadline = (Get-Date).AddMinutes(3)
+          if ($botUser) {
+            while (-not $chat -and (Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-RestMethod "https://api.telegram.org/bot$tg/getUpdates?timeout=15&offset=$offset"
+                if ($r -and $r.ok) {
+                  foreach ($upd in @($r.result)) {
+                    $offset = [long]$upd.update_id + 1
+                    $msg = $upd.message
+                    if (-not $chat -and $msg -and $msg.text -and $msg.text -match '^/start') {
+                      $chat = "$($msg.chat.id)"
+                      Set-Content -Path $chatFile -Value $chat -NoNewline -Encoding utf8
+                      Write-Host "Telegram chat connected: $chat"
+                      break
+                    }
+                  }
+                }
+              } catch { Write-Host "Telegram poll failed: $_"; Start-Sleep -Seconds 3 }
+            }
+          }
+
+          if ($chat) {
+            try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tg/sendMessage" -Body @{ chat_id = $chat; text = "Telegram connected. I will send the Tailscale link, then the RDP host/user/password here." } | Out-Null } catch {}
+            W ""
+            W "Telegram setup complete and saved. Future runs reuse this token and chat with no input."
+            Write-Host "Telegram setup complete and saved (token + chat id are in the state cache)."
+          } else {
+            W ""
+            W "Telegram link not opened yet. The setup continues; the link stays valid and the keep-alive step keeps checking."
+            Write-Host "Telegram link not opened yet - continuing."
+          }
+
+          "TG_TOKEN_RESOLVED=$tg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TG_CHAT_RESOLVED=$chat" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TG_OFFSET=$offset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TG_FROM_INPUT=$(if ($fromInput) { '1' } else { '0' })" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ----------------------------------------------------------------------
+      # 4. Join Tailscale. If there is no saved login, show a link and PAUSE
+      #    until the machine is linked, then continue automatically.
+      # ----------------------------------------------------------------------
+      - name: Connect Tailscale (waits for your login link if needed)
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $sum = $env:GITHUB_STEP_SUMMARY
+          function W($t) { if ($sum) { $t | Out-File -FilePath $sum -Append -Encoding utf8 } }
+          function TgRaw($text) {
+            if (-not $env:TG_TOKEN_RESOLVED -or -not $env:TG_CHAT_RESOLVED) { return }
+            try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$($env:TG_TOKEN_RESOLVED)/sendMessage" -Body @{ chat_id = $env:TG_CHAT_RESOLVED; text = $text } | Out-Null } catch {}
+          }
+          function GetStatus() {
+            try {
+              $raw = (& $exe status --json 2>$null | Out-String).Trim()
+              if (-not $raw) { return $null }
+              $idx = $raw.IndexOf('{')
+              if ($idx -gt 0) { $raw = $raw.Substring($idx) }
+              return ($raw | ConvertFrom-Json -ErrorAction Stop)
+            } catch { return $null }
+          }
+          function GetIP() {
+            try {
+              $raw = (& $exe ip -4 2>$null | Out-String).Trim()
+              if ($raw) {
+                $first = ($raw -split "\r?\n") | Where-Object { $_ } | Select-Object -First 1
+                if ($first) { return $first.Trim() }
+              }
+            } catch {}
+            return $null
+          }
+          function IsOnline() {
+            $st = GetStatus
+            if ($st) {
+              if ($st.Self -and $st.Self.Online -eq $true) { return $true }
+              if ($st.BackendState -eq 'Running') { return $true }
+              return $false
+            }
+            if (GetIP) { return $true }
+            return $false
+          }
+
+          $out = Join-Path $env:RUNNER_TEMP "ts-out.log"
+          $err = Join-Path $env:RUNNER_TEMP "ts-err.log"
+          Remove-Item $out,$err -Force -ErrorAction SilentlyContinue
+
+          if ($env:TS_AUTHKEY) {
+            W ""
+            W "## Tailscale: using auth key"
+            & $exe up --authkey "$env:TS_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false 2>&1 | Out-Host
+          } elseif (IsOnline) {
+            W ""
+            W "## Tailscale: restored login is already online"
+            Write-Host "Tailscale login restored from cache - no link needed."
+          } else {
+            W ""
+            W "## ACTION NEEDED: link Tailscale"
+            W ""
+            Start-Process -FilePath $exe -ArgumentList @("up","--hostname",$env:TS_HOSTNAME,"--accept-routes","--accept-dns=false") -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow | Out-Null
+          }
+
+          $url = $null
+          $warnedAuth = $false
+          $startWait = Get-Date
+          $nextReport = Get-Date
+          $lastKick = Get-Date
+          $online = $false
+          $loggedRaw = $false
+
+          while ((Get-Date) -lt $startWait.AddMinutes(30)) {
+            if (IsOnline) { $online = $true; break }
+            $now = Get-Date
+            $st = GetStatus
+            $state = if ($st) { "$($st.BackendState)" } else { 'unreachable' }
+            $selfOnline = if ($st -and $st.Self) { "$($st.Self.Online)" } else { '-' }
+
+            if ($st -and $st.AuthURL -and $st.AuthURL -ne $url) {
+              $url = $st.AuthURL
+              W ""
+              W "### $url"
+              W ""
+              W "Open this link, log in and approve the machine. This step continues automatically once it is online."
+              TgRaw "ACTION NEEDED: link this machine to Tailscale`nOpen: $url`nSetup is paused until you finish."
+              Write-Host "=========================================================="
+              Write-Host " TAILSCALE LOGIN LINK: $url"
+              Write-Host "=========================================================="
+              Write-Host "::notice title=Tailscale login required::Open this link to connect the machine: $url"
+            }
+
+            if ($now -ge $nextReport) {
+              $ipNow = GetIP
+              Write-Host "[tailscale] state=$state selfOnline=$selfOnline ip=$ipNow elapsed=$([int]($now - $startWait).TotalSeconds)s"
+              W "- poll: state=$state online=$selfOnline ip=$ipNow"
+              if (-not $loggedRaw) {
+                $loggedRaw = $true
+                try {
+                  $raw = (& $exe status --json 2>$null | Out-String).Trim()
+                  if ($raw) { Write-Host ("[tailscale raw] " + $raw.Substring(0, [Math]::Min(1500, $raw.Length))) }
+                } catch {}
+              }
+              $nextReport = $now.AddSeconds(30)
+            }
+
+            if ($st -and $st.BackendState -eq 'NeedsMachineAuth' -and -not $warnedAuth) {
+              $warnedAuth = $true
+              W ""
+              W "> This machine needs approval in the Tailscale admin console: https://login.tailscale.com/admin/machines (look for $env:TS_HOSTNAME)"
+              TgRaw "Tailscale: this machine needs approval in the admin console (Machines page). Look for $env:TS_HOSTNAME."
+            }
+
+            # Keep a live "up" waiter running; some environments exit the first
+            # one after printing the link, leaving the node in NeedsLogin.
+            if ($now -ge $lastKick.AddSeconds(90)) {
+              $kickOut = Join-Path $env:RUNNER_TEMP ("ts-out-" + [guid]::NewGuid().ToString("N") + ".log")
+              $kickErr = Join-Path $env:RUNNER_TEMP ("ts-err-" + [guid]::NewGuid().ToString("N") + ".log")
+              Start-Process -FilePath $exe -ArgumentList @("up","--hostname",$env:TS_HOSTNAME,"--accept-routes","--accept-dns=false") -RedirectStandardOutput $kickOut -RedirectStandardError $kickErr -PassThru -NoNewWindow | Out-Null
+              $lastKick = $now
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $online) {
+            $st = GetStatus
+            $state = if ($st) { "$($st.BackendState)" } else { 'unreachable' }
+            W ""
+            W "## Tailscale did not come online"
+            W "Last state: $state. Re-run the workflow and open the link when it appears."
+            Write-Host "Tailscale did not come online in time (last state: $state)."
+            exit 1
+          }
+
+          $ip = GetIP
+          $stFinal = GetStatus
+          $dns = if ($stFinal -and $stFinal.Self -and $stFinal.Self.DNSName) { "$($stFinal.Self.DNSName)".TrimEnd('.') } else { $env:TS_HOSTNAME }
+          W ""
+          W "## Tailscale connected"
+          W "- Host: $dns"
+          W "- IP: $ip"
+          TgRaw "Tailscale linked. Machine is online as $dns ($ip). Continuing setup..."
+          Write-Host "Tailscale IP: $ip"
+
+      # ----------------------------------------------------------------------
+      # 5. Enable RDP. Generate + save a password on the first run.
+      # ----------------------------------------------------------------------
+      - name: Enable RDP (creates and saves a password if missing)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $pw = $env:RDP_PASSWORD
+          $pwFile = Join-Path $env:MIGRATION "rdp_password.txt"
+          if ([string]::IsNullOrWhiteSpace($pw) -and (Test-Path $pwFile)) {
+            $pw = (Get-Content $pwFile -Raw).Trim()
+            Write-Host "Reusing the saved RDP password from the last machine."
+          }
+          if ([string]::IsNullOrWhiteSpace($pw)) {
+            $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*'
+            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+            $bytes = New-Object byte[] 24
+            $rng.GetBytes($bytes)
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($b in $bytes) { [void]$sb.Append($chars[$b % $chars.Length]) }
+            $pw = $sb.ToString()
+            Write-Host "Generated a new RDP password."
+          }
+          "RDP_PASSWORD_ACTUAL=$pw" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          try { Set-Content -Path $pwFile -Value $pw -NoNewline -Encoding utf8; Write-Host "RDP password saved with the state so it survives rebuilds." } catch { Write-Host "Could not write password to state (continuing): $_" }
+
+          $u = $env:RDP_USER
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "RDP enabled for $u"
+          $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null | Out-String).Trim()
+          if ($tsip) { $tsip = ($tsip -split "\r?\n" | Where-Object { $_ } | Select-Object -First 1).Trim() }
+          Write-Host "=========================================================="
+          Write-Host " RDP LOGIN"
+          Write-Host " Host/IP:  $tsip"
+          Write-Host " Username: $u"
+          Write-Host " Password: $pw"
+          Write-Host "=========================================================="
+
+      # ----------------------------------------------------------------------
+      # 6. Run an optional startup script from the migrated files.
+      # ----------------------------------------------------------------------
+      - name: Run migration startup script
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+          $s = Join-Path $env:MIGRATION "startup.ps1"
+          if (Test-Path $s) {
+            Write-Host "Running D:\Migration\startup.ps1 ..."
+            try {
+              powershell -ExecutionPolicy Bypass -File $s 2>&1 | Out-Host
+              if ($LASTEXITCODE -ne 0) { Write-Host "startup.ps1 exited with $LASTEXITCODE (continuing)." }
+            } catch { Write-Host "startup.ps1 error (continuing): $_" }
+          } else { Write-Host "No startup.ps1 in D:\Migration." }
+
+      # ----------------------------------------------------------------------
+      # 7. Announce connection details, keep the machine alive, handle the
+      #    Telegram bot (status message + buttons + commands), then loop.
+      # ----------------------------------------------------------------------
+      - name: Notify Telegram + keep alive + countdown
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          IN_RUNTIME: ${{ inputs.runtime_minutes }}
+          IN_TEST: ${{ inputs.test_mode }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $pw = $env:RDP_PASSWORD_ACTUAL
+          if ([string]::IsNullOrWhiteSpace($pw)) { $pw = $env:RDP_PASSWORD }
+          $tg = $env:TG_TOKEN_RESOLVED
+          $chat = $env:TG_CHAT_RESOLVED
+          $offset = 0
+          if ($env:TG_OFFSET) { $offset = [long]$env:TG_OFFSET }
+          $chatFile = Join-Path $env:MIGRATION "telegram_chat_id.txt"
+          $code = "r${{ github.run_id }}"
+          $forward = ""
+          if ($env:TG_FROM_INPUT -eq '1') { $forward = $tg }
+
+          function Tg($text, $replyMarkup = $null) {
+            if (-not $tg -or -not $chat) { return }
+            try {
+              $body = @{ chat_id = $chat; text = $text }
+              if ($replyMarkup) { $body.reply_markup = ($replyMarkup | ConvertTo-Json -Compress) }
+              Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tg/sendMessage" -Body $body | Out-Null
+            } catch { Write-Host "Tg failed: $_" }
+          }
+          function TgAnswer($callbackId, $text) {
+            if (-not $tg) { return }
+            try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tg/answerCallbackQuery" -Body @{ callback_query_id = $callbackId; text = $text } | Out-Null } catch {}
+          }
+          function TriggerRunner() {
+            try {
+              $payload = @{ ref = "${{ github.ref_name }}"; inputs = @{ runtime_minutes = "${{ inputs.runtime_minutes }}"; test_mode = "false" } }
+              if ($forward) { $payload.inputs.telegram_token = "$forward" }
+              $json = $payload | ConvertTo-Json -Compress
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp.yml/dispatches" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -ContentType "application/json" -Body $json | Out-Null
+              return $true
+            } catch { Write-Host "TriggerRunner failed: $_"; return $false }
+          }
+
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = (& $exe ip -4 2>$null | Out-String).Trim()
+          if ($ip) { $ip = ($ip -split "\r?\n" | Where-Object { $_ } | Select-Object -First 1).Trim() }
+          $dns = $env:TS_HOSTNAME
+          try {
+            $raw = (& $exe status --json 2>$null | Out-String).Trim()
+            $idx = $raw.IndexOf('{'); if ($idx -gt 0) { $raw = $raw.Substring($idx) }
+            $st = $raw | ConvertFrom-Json
+            if ($st.Self -and $st.Self.DNSName) { $dns = "$($st.Self.DNSName)".TrimEnd('.') }
+          } catch {}
+
+          Write-Host "=========================================================="
+          Write-Host " RDP CONNECTION DETAILS"
+          Write-Host " Host (Tailscale): $dns"
+          Write-Host " IP:               $ip"
+          Write-Host " Username:         $env:RDP_USER"
+          Write-Host " Password:         $pw"
+          Write-Host "=========================================================="
+          Write-Host "::notice title=RDP connection details::Host $dns | IP $ip | User $env:RDP_USER | Pass $pw"
+
+          $runtime = [int]$env:IN_RUNTIME
+          if ("$env:IN_TEST" -eq "true") { $runtime = 5 }
+          if ($runtime -gt 340) { $runtime = 340 }
+          if ($runtime -lt 5) { $runtime = 330 }
+
+          $start = Get-Date
+          $end = $start.AddMinutes($runtime)
+
+          $sum = $env:GITHUB_STEP_SUMMARY
+          if ($sum) {
+            @(
+              "",
+              "## RDP is up",
+              "",
+              "| Field | Value |",
+              "| --- | --- |",
+              "| Host (Tailscale) | $dns |",
+              "| IP | $ip |",
+              "| User | $env:RDP_USER |",
+              "| Password | $pw |",
+              "| Runtime | $runtime min |",
+              "",
+              "### How to connect",
+              "1. Install Tailscale on your phone/PC and sign in to the same Tailscale account.",
+              "2. Open an RDP app (Windows Remote Desktop, Microsoft Remote Desktop, Remmina, ...).",
+              "3. Computer: ``$dns`` (or ``$ip``) - Username: ``$env:RDP_USER`` - Password: ``$pw``",
+              ""
+            ) | Out-File -FilePath $sum -Append -Encoding utf8
+          }
+
+          $nextClock = $start.AddMinutes(60)
+          $nextStatus = $start
+          $statusId = $null
+          $buttons = @{ inline_keyboard = @(@(@{ text = "Status"; callback_data = "status" }, @{ text = "Start New Runner"; callback_data = "start_new" })) }
+
+          while ((Get-Date) -lt $end) {
+            $now = Get-Date
+            $left = [int][math]::Ceiling(($end - $now).TotalMinutes)
+            $elapsed = [int][math]::Floor(($now - $start).TotalMinutes)
+            $statusText = "RDP UP`nHost: $dns`nIP: $ip`nUser: $env:RDP_USER`nPass: $pw`nElapsed: $elapsed min`nLeft: $left min`nUse /status or the buttons."
+
+            if ($now -ge $nextClock) {
+              Tg "Clock: RDP box has $left min left"
+              $nextClock = $now.AddMinutes(60)
+            }
+            if (-not $statusId -and $tg -and $chat) {
+              try {
+                $res = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tg/sendMessage" -Body @{ chat_id = $chat; text = $statusText; reply_markup = ($buttons | ConvertTo-Json -Compress) }
+                $statusId = $res.result.message_id
+              } catch { Write-Host "Initial status send failed: $_" }
+              $nextStatus = $now.AddMinutes(5)
+            } elseif ($statusId -and $now -ge $nextStatus) {
+              try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tg/editMessageText" -Body @{ chat_id = $chat; message_id = $statusId; text = $statusText; reply_markup = ($buttons | ConvertTo-Json -Compress) } | Out-Null } catch {}
+              $nextStatus = $now.AddMinutes(5)
+            }
+
+            if ($tg) {
+              try {
+                $u = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$tg/getUpdates?timeout=20&offset=$offset"
+                if ($u -and $u.ok) {
+                  foreach ($upd in @($u.result)) {
+                    $offset = [long]$upd.update_id + 1
+                    if ($upd.callback_query) {
+                      $cb = $upd.callback_query
+                      if (-not $chat -and $cb.message -and $cb.message.chat) {
+                        $chat = "$($cb.message.chat.id)"
+                        Set-Content -Path $chatFile -Value $chat -NoNewline -Encoding utf8
+                      }
+                      if ($cb.data -eq "status") {
+                        TgAnswer $cb.id "Status: $left min left"
+                        Tg $statusText $buttons
+                      } elseif ($cb.data -eq "start_new") {
+                        if (TriggerRunner) { TgAnswer $cb.id "Starting new runner..." } else { TgAnswer $cb.id "Failed to start runner" }
+                      } else { TgAnswer $cb.id "Unknown command" }
+                    } elseif ($upd.message -and $upd.message.text) {
+                      $text = $upd.message.text.Trim()
+                      $first = ($text -split '\s+')[0].ToLower()
+                      if (-not $chat) {
+                        $chat = "$($upd.message.chat.id)"
+                        Set-Content -Path $chatFile -Value $chat -NoNewline -Encoding utf8
+                        Tg "Telegram connected. Sending RDP details here."
+                      }
+                      if ($first -eq "/status") {
+                        Tg $statusText $buttons
+                      } elseif ($first -eq "/start") {
+                        $payload = $text.Substring(6).Trim()
+                        if ($payload -and $payload -eq $code) {
+                          Tg "Already connected. RDP details are above."
+                        } elseif ($payload) {
+                          Tg "Connected."
+                        } elseif (TriggerRunner) {
+                          Tg "New runner dispatched."
+                        } else {
+                          Tg "Failed to dispatch new runner."
+                        }
+                      } else {
+                        Tg "Commands: /status (details), /start (new runner)."
+                      }
+                    }
+                  }
+                }
+              } catch { Write-Host "Update poll failed: $_"; Start-Sleep -Seconds 5 }
+            }
+            if (-not $tg) { Start-Sleep -Seconds 30 }
+          }
+          Tg "This RDP session is ending now. The next runner starts shortly if the loop is enabled."
+
+      # ----------------------------------------------------------------------
+      # 8. Save files + Tailscale login for the next machine.
+      # ----------------------------------------------------------------------
+      - name: Stop Tailscale and copy its login into the state
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          $dst = Join-Path $env:MIGRATION "tailscale"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $loc = @(
+            @{ Name = "programdata"; Path = "C:\ProgramData\Tailscale" },
+            @{ Name = "user";        Path = (Join-Path $env:LOCALAPPDATA "Tailscale") },
+            @{ Name = "system";      Path = "C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale" }
+          )
+          $saved = 0
+          foreach ($l in $loc) {
+            if (-not (Test-Path $l.Path)) { continue }
+            $target = Join-Path $dst $l.Name
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Get-ChildItem -Path $l.Path -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like '*.conf' -or $_.Name -like '*.state' } |
+              ForEach-Object {
+                Copy-Item $_.FullName (Join-Path $target $_.Name) -Force -ErrorAction SilentlyContinue
+                if (Test-Path (Join-Path $target $_.Name)) {
+                  Write-Host ("Saved Tailscale state: " + $_.FullName)
+                  $saved++
+                }
+              }
+          }
+          if ($saved -gt 0) {
+            Write-Host "Tailscale login saved ($saved file(s)) - next machine will reuse it."
+          } else {
+            Write-Host "WARNING: no Tailscale state files found - next machine will need a new link."
+          }
+          Write-Host "Tailscale stopped."
+
+      - name: Save state (files + Tailscale login)
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: D:\Migration
+          key: rdp-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ----------------------------------------------------------------------
+      # 9. Auto-loop: start the next machine.
+      # ----------------------------------------------------------------------
+      - name: Trigger next machine (loop)
+        if: ${{ always() && inputs.test_mode != true }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $tok = ""
+          if ($env:TG_FROM_INPUT -eq '1') { $tok = $env:TG_TOKEN_RESOLVED }
+          if ($tok) { Write-Output "::add-mask::$tok" }
+          $args = @("workflow","run","rdp.yml","--repo","${{ github.repository }}","--ref","${{ github.ref_name }}","-f","runtime_minutes=${{ inputs.runtime_minutes }}","-f","test_mode=false")
+          if ($tok) { $args += @("-f","telegram_token=$tok") }
+          try {
+            & gh @args 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Host "Dispatch exited with $LASTEXITCODE (workflow may be disabled, or not on the default branch) - continuing." }
+          } catch { Write-Host "Dispatch failed (continuing): $_" }
+          Write-Host "Next machine dispatch attempted."
